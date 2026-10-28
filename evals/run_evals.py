@@ -37,9 +37,16 @@ def appears(expected: float, found: list[float]) -> bool:
     return any(abs(v - expected) <= max(abs(expected) * TOLERANCE, 0.01) for v in found)
 
 
-def grade(case: dict, answer: str, con) -> list[str]:
+def grade(case: dict, result: dict, con) -> list[str]:
     """Return the reasons the answer fails; an empty list is a pass."""
+    answer, fallback = result["answer"], result.get("fallback")
     failures = []
+    expected = case.get("expect_fallback")
+    if expected and (fallback is None or fallback["reason"] not in expected):
+        got = fallback["reason"] if fallback else "an agent answer"
+        failures.append(f"expected a fallback ({' or '.join(expected)}), got {got}")
+    if not expected and fallback:
+        failures.append(f"fell back ({fallback['reason']}) on an answerable question")
     found = numbers_in(answer)
     if "expect_sql" in case:
         for expected in con.execute(case["expect_sql"]).fetchone():
@@ -84,15 +91,17 @@ def main() -> None:
             continue
         started = time.monotonic()
         result = ask(case["question"], case["brand"], definitions=not args.no_definitions)
-        failures = grade(case, result["answer"], con)
+        failures = grade(case, result, con)
         scored += 1
         passed += not failures
         tools_used = " > ".join(c["tool"] + ("!" if c["error"] else "") for c in result["tool_calls"])
-        print(f"{'PASS' if not failures else 'FAIL'}  {case['id']}  ({result['turns']} turns: {tools_used})")
+        ending = f", fallback: {result['fallback']['reason']}" if result.get("fallback") else ""
+        print(f"{'PASS' if not failures else 'FAIL'}  {case['id']}  ({result['turns']} turns: {tools_used}{ending})")
         for f in failures:
             print(f"        {f}")
         rows.append({**case, "status": "pass" if not failures else "fail", "failures": failures,
                      "answer": result["answer"], "tool_calls": result["tool_calls"],
+                     "fallback": result.get("fallback"),
                      "turns": result["turns"], "seconds": round(time.monotonic() - started, 1)})
 
     print(f"\n{passed}/{scored} passed" + (" (without definitions)" if args.no_definitions else ""))

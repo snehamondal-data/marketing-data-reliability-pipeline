@@ -38,9 +38,10 @@ TOOL_DEFINITIONS = [
         "description": (
             "Run one read-only DuckDB SELECT against this brand's marts and get the rows back as JSON. "
             "Only SELECT (WITH ... SELECT and UNION are fine). Only tables returned by list_tables, "
-            f"qualified or not. At most {MAX_ROWS} rows come back; 'truncated': true means there were "
-            f"more, so aggregate in SQL instead. Queries are cancelled after {QUERY_TIMEOUT_SECONDS}s. "
-            "A rejected query returns an error explaining why; fix it and try again."
+            f"qualified or not. If more than {MAX_ROWS} rows match, no rows come back and the query is "
+            f"rejected: aggregate in SQL or add a LIMIT. Queries are cancelled after {QUERY_TIMEOUT_SECONDS}s. "
+            "A rejected query returns an error explaining why; fix it and try again. Statements that "
+            "change data, or read outside this brand's marts, end the question with no answer."
         ),
         "input_schema": {
             "type": "object",
@@ -65,7 +66,14 @@ TOOL_DEFINITIONS = [
 
 
 class QueryRejected(Exception):
-    """The SQL broke a guardrail. The message goes back to the model so it can correct itself."""
+    """The SQL broke a guardrail.
+
+    kind is "unsafe" (not a read, or outside this tenant's marts: the loop stops), or a fixable
+    mistake the model may correct: "invalid", "row_limit" or "timeout".
+    """
+    def __init__(self, message: str, kind: str = "invalid"):
+        super().__init__(message)
+        self.kind = kind
 
 
 def _jsonable(value):
@@ -132,27 +140,29 @@ class Tools:
             statements = [s for s in sqlglot.parse(sql, read="duckdb") if s is not None]
         except sqlglot.errors.ParseError as e:
             raise QueryRejected(f"could not parse SQL: {e}") from None
-        if len(statements) != 1:
-            raise QueryRejected("send exactly one statement")
+        if len(statements) > 1:
+            raise QueryRejected("send exactly one statement", "unsafe")
+        if not statements:
+            raise QueryRejected("empty query")
         tree = statements[0]
         if not isinstance(tree, exp.Query):
-            raise QueryRejected(f"only SELECT is allowed, got {tree.key.upper()}")
+            raise QueryRejected(f"only SELECT is allowed, got {tree.key.upper()}", "unsafe")
         if any(tree.find_all(exp.DDL, exp.DML, exp.Command, exp.Pragma, exp.Set, exp.Use)):
-            raise QueryRejected("only SELECT is allowed")
+            raise QueryRejected("only SELECT is allowed", "unsafe")
 
         cte_names = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
         for table in tree.find_all(exp.Table):
             if not isinstance(table.this, exp.Identifier):
-                raise QueryRejected(f"table functions are not allowed: {table.this.sql('duckdb')}")
+                raise QueryRejected(f"table functions are not allowed: {table.this.sql('duckdb')}", "unsafe")
             if table.catalog or (table.db and table.db != self.schema):
-                raise QueryRejected(f"{table.sql('duckdb')} is outside {self.schema}")
+                raise QueryRejected(f"{table.sql('duckdb')} is outside {self.schema}", "unsafe")
             if not table.db and table.name in cte_names:
                 continue
             if table.name not in self.tables:
                 raise QueryRejected(f"unknown table {table.name!r}; call list_tables")
             table.set("db", exp.to_identifier(self.schema))   # resolve unqualified names here, not via search_path
 
-        # Cap the rows that come back. MAX_ROWS + 1 lets us tell the model it was truncated.
+        # Cap the rows read. MAX_ROWS + 1 lets run_query tell that more rows matched.
         existing = tree.args.get("limit")
         cap = MAX_ROWS + 1
         if existing is None or not (isinstance(existing.expression, exp.Literal)
@@ -160,25 +170,30 @@ class Tools:
             tree = tree.limit(cap)
         return tree.sql("duckdb")
 
-    def run_query(self, sql: str) -> dict:
+    def run_query(self, sql: str, params: list | None = None) -> dict:
+        """params is only for the fixed fallback reports; the model's tool schema has sql alone."""
         executed = self.check_sql(sql)
         timer = threading.Timer(QUERY_TIMEOUT_SECONDS, self.con.interrupt)
         timer.start()
         started = time.monotonic()
         try:
-            cursor = self.con.execute(executed)
+            cursor = self.con.execute(executed, params or [])
             columns = [d[0] for d in cursor.description]
             rows = cursor.fetchall()
         except duckdb.InterruptException:
-            raise QueryRejected(f"query cancelled after {QUERY_TIMEOUT_SECONDS}s; aggregate or filter more") from None
+            raise QueryRejected(f"query cancelled after {QUERY_TIMEOUT_SECONDS}s; aggregate or filter more",
+                                "timeout") from None
         finally:
             timer.cancel()
+        # All or nothing: a partial result could be answered from as if it were the whole.
+        if len(rows) > MAX_ROWS:
+            raise QueryRejected(f"more than {MAX_ROWS} rows match, so none were returned; aggregate "
+                                "in SQL or add a LIMIT", "row_limit")
         return {
             "executed_sql": executed,
             "columns": columns,
-            "rows": [[_jsonable(v) for v in row] for row in rows[:MAX_ROWS]],
-            "row_count": min(len(rows), MAX_ROWS),
-            "truncated": len(rows) > MAX_ROWS,
+            "rows": [[_jsonable(v) for v in row] for row in rows],
+            "row_count": len(rows),
             "elapsed_ms": round((time.monotonic() - started) * 1000),
         }
 

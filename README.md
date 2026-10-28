@@ -1,12 +1,25 @@
 # Marketing Data Reliability Pipeline
 
-A small but complete pipeline that answers the question every e-commerce operator asks: **for every dollar we spent on ads, how much real revenue came back?**
+**For every dollar an online store spends on ads, how much real money comes back, and is it being spent on products that are about to sell out?**
 
-It ingests daily ad spend from Meta and Google alongside the store's own orders and refunds, cleans up inconsistent campaign and UTM naming, and reconciles spend against the revenue the store actually kept. The outputs are MER, ROAS, AOV and new-customer CAC that can be trusted.
+**The problem.** Ad platforms each take credit for the same sale, so their numbers add up to more than the store actually made. And ads keep running on a product after it sells out: customers keep ordering it, and then those orders get cancelled.
 
-It then asks the follow-up question that ROAS can't answer: **are we spending that money on something we're about to run out of?** Stock counts, line items and purchase orders feed a spend-at-risk mart and an alert digest, so a campaign burning budget on a SKU with four days of cover shows up before the stockout, not after.
+**What it does.** It pulls a store's ad spend, orders, refunds and stock levels, cleans them up, and works out how much revenue each ad dollar really brought back. It warns when ads are paying to promote a product that's about to run out. A built-in assistant answers questions about the numbers in plain English.
+
+**Results.**
+- **The warning comes early.** In the test data it flagged one brand's best-selling product, a serum, 18 days before it sold out. The ads kept running anyway: an estimated $1,600 went on advertising it after there was none left to sell.
+- **A sell-out costs more than the missing product.** When an order is cancelled, everything else in the cart goes with it. The first version missed this: $347 of other products for one brand and $1,661 for the other. Writing the assistant's test questions exposed the gap, and it's now measured.
+- **The assistant's first test was too easy.** It got 10 out of 10 right, both with and without written definitions of the business terms, so the test couldn't show whether the definitions help. Four harder questions have been added since but not yet run against the live AI.
+
+**How it's kept safe.** Three separate layers, so no single check is trusted alone: the assistant can only read the data, never change it; every query it writes is checked before it runs; and it sees one brand at a time, chosen by the person using it, not by the AI. When it can't answer safely, it gives a fixed, pre-written reply or asks a clarifying question instead of guessing.
 
 > This project runs on **synthetic data** served by a **fake paginated API** (`source/`). It's not a live Shopify or ad-platform integration. The fake API behaves like the real ones in the ways that matter here: it paginates, rate-limits, fails intermittently, repeats records, delivers some data late, and restates spend after the fact.
+
+## What it computes
+
+The pipeline ingests daily ad spend from Meta and Google alongside the store's own orders and refunds, cleans up inconsistent campaign and UTM naming, and reconciles spend against the revenue the store actually kept. The outputs are MER, ROAS, AOV and new-customer CAC that can be trusted.
+
+It then asks the follow-up question that ROAS can't answer: **are we spending that money on something we're about to run out of?** Stock counts, line items and purchase orders feed a spend-at-risk mart and an alert digest, so a campaign burning budget on a SKU with four days of cover shows up before the stockout, not after. The analytics agent, its guardrails and its evals are described [below](#analytics-agent).
 
 ## Why this is harder than it looks
 
@@ -57,6 +70,7 @@ alerts/
 agent/                    a CLI agent that answers questions over one brand's marts (see below)
   loop.py                 the agent loop and system prompt
   tools.py                list_tables, run_query, get_data_health, and the SQL guardrails
+  fallbacks.py            deterministic fallbacks: fixed explanations, clarifying questions and reports
 evals/                    questions with SQL-computed answers, and a script that scores the agent
 tests/                    pytest suite for ingestion, the stockout scenario, and the agent's guardrails
 ```
@@ -70,7 +84,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python run_pipeline.py --demo   # wipe data/, generate, three incremental runs, idempotency check
-python -m pytest                # 46 tests: ingestion, the stockout scenario, the agent (no API key needed)
+python -m pytest                # 83 tests: ingestion, the stockout scenario, the agent (no API key needed)
 ```
 
 The demo takes three or four minutes (nine entities, three runs, two brands), ends with a summary per brand, and writes an alert digest to `data/alerts/`. After that:
@@ -105,7 +119,7 @@ Every ratio returns NULL rather than 0 when its denominator is zero. A day with 
 
 Ad spend and stock are the same problem. A campaign performs, so it keeps spending, but the SKU it promotes is about to sell out. Orders still arrive, they go on backorder, and two weeks later a chunk of those customers cancel. You paid for clicks that turned into refunds, and per-campaign ROAS looked fine the whole time, because the revenue was booked before the cancellation.
 
-This half of the pipeline answers one question — *which campaign is spending money on something we're about to run out of?* — and answers it before the stockout rather than after.
+This half of the pipeline answers one question: *which campaign is spending money on something we're about to run out of?* It answers it before the stockout rather than after.
 
 ### The metrics
 
@@ -154,13 +168,13 @@ Two decisions worth explaining:
 
 **The observed side is smoothed; only the baseline is long.** A single day's MER on twenty orders swings by a third on its own. Comparing one noisy day against a smooth 14-day baseline fires constantly, and an alerting layer that cries wolf gets muted within a week. So each rule compares a 3-day average against the trailing baseline, and each has a minimum-volume guard. On the demo data the smoothing takes `acme_apparel` from 14 MER alerts over two months down to 4.
 
-**A promised delivery date that has already passed is not a delivery.** A PO stays open when the supplier misses its date, so `next_restock_date` can be in the past. `mart_spend_at_risk` only counts a restock that is still in the future, which means an overdue PO makes the SKU look unprotected — because it is.
+**A promised delivery date that has already passed is not a delivery.** A PO stays open when the supplier misses its date, so `next_restock_date` can be in the past. `mart_spend_at_risk` only counts a restock that is still in the future, which means an overdue PO makes the SKU look unprotected, because it is.
 
 ### The push step
 
 `alerts/digest.py` runs at the end of every pipeline run: it reads the most recent date in `mart_alerts` per brand, writes `data/alerts/<brand>_<date>.md`, and prints the most severe alerts. It uses the latest date in the data rather than the wall clock, because the synthetic sources stop at the end of August.
 
-Slack and email delivery are deliberately not built. They need a credential, a retry policy and a deduplication rule of their own, and the part worth showing — deciding what is worth saying — is here.
+Slack and email delivery are deliberately not built. They need a credential, a retry policy and a deduplication rule of their own, and the part worth showing is here: deciding what is worth saying.
 
 ### The scenario in the demo data
 
@@ -227,7 +241,7 @@ On top of `unique` / `not_null` / `relationships` / `accepted_values` on every k
 | `assert_campaigns_with_spend_have_products` | warn | A campaign with spend but no SKU mapping, so its spend can't be checked against stock. A warning rather than an error because brand and PMax campaigns legitimately promote the whole catalogue |
 | `mart_alerts` key uniqueness | error | Duplicate alerts for the same day, type and entity, which would double-count in the digest |
 
-The pipeline's Python tests (23 of them; the agent adds 23 more, described below) cover pagination ending, retryable vs fatal errors, backoff, idempotent reloads, duplicates within a batch, rollback on bad records, the checkpoint not moving on failure, and the lookback catching late records (and missing them with no lookback). `test_alerts.py` then checks the built warehouse end to end: that the designed stockout is still in the data, that spend on an out-of-stock SKU is flagged, and that the predictive alert fires at least three days before the stockout.
+The pipeline's Python tests (23 of them; the agent adds 60 more, described below) cover pagination ending, retryable vs fatal errors, backoff, idempotent reloads, duplicates within a batch, rollback on bad records, the checkpoint not moving on failure, and the lookback catching late records (and missing them with no lookback). `test_alerts.py` then checks the built warehouse end to end: that the designed stockout is still in the data, that spend on an out-of-stock SKU is flagged, and that the predictive alert fires at least three days before the stockout.
 
 ## Edge cases handled
 
@@ -287,22 +301,23 @@ The API keeps no state between calls, so each turn resends the whole conversatio
 | Tool | Returns | Why it exists |
 |---|---|---|
 | `list_tables` | Every table in `<brand>_marts`, with the dbt model description and columns and types | So the model reads the schema instead of guessing it. Descriptions come from the dbt manifest, so the docs written for people also reach the model |
-| `run_query(sql)` | Rows as JSON, the SQL that actually ran, and whether the result was truncated | The only way to get a number |
+| `run_query(sql)` | Rows as JSON and the SQL that actually ran, or a rejection saying why | The only way to get a number |
 | `get_data_health` | Latest date per table, ingestion watermarks, and the latest dbt test results with the models each failing or warning test covers | So an answer can say what it is based on ("data through Aug 29"), and whether a model it used has a warning |
+| `cannot_answer(reason)` | Nothing to the model: it ends the question with a fixed explanation or clarifying question for that reason | So the model can say "I can't answer this" without writing the words itself (see Deterministic fallbacks) |
 
-**Tool definitions are a contract.** A tool's name, input schema and description are the whole interface between the model and the code, the same way a data contract is the whole interface between a producer and a consumer. The consumer can only rely on what the contract states. If `run_query` doesn't say it caps rows, the model can't know a 200-row result might be partial; if it doesn't say what a rejection looks like, the model can't recover from one. So the descriptions state limits and failure modes, not only purpose, and the schemas are `strict`, so the model can't send arguments the code doesn't accept.
+**Tool definitions are a contract.** A tool's name, input schema and description are the whole interface between the model and the code, the same way a data contract is the whole interface between a producer and a consumer. The consumer can only rely on what the contract states. If `run_query` doesn't say what happens past 200 rows, the model can't plan for it; if it doesn't say what a rejection looks like, the model can't recover from one. So the descriptions state limits and failure modes, not only purpose, and the schemas are `strict`, so the model can't send arguments the code doesn't accept.
 
 ### Guardrails
 
 | Guardrail | How |
 |---|---|
-| SELECT only | `sqlglot` parses the SQL. Exactly one statement, it must be a query, and no DDL, DML, `COPY`, `ATTACH`, `PRAGMA` or `SET` anywhere in it |
+| SELECT only | `sqlglot` parses the SQL. Exactly one statement, it must be a query, and no DDL, DML, `COPY`, `ATTACH`, `PRAGMA` or `SET` anywhere in it. A query that breaks this ends the question with a fixed refusal; the model gets no second try |
 | One tenant per session | The brand is a required CLI argument, not something the model picks. Every table reference must be one of that brand's mart tables. Raw, staging, other brands, `information_schema` and table functions like `read_csv()` are rejected |
 | Defence in depth | The connection is read-only, with file and environment access turned off and the configuration locked. `getenv()` gets past the parser and is stopped here; there's a test for that |
-| Row cap | A `LIMIT 201` goes on every query; 200 rows come back, with `truncated: true` if there were more |
+| Row cap | A `LIMIT 201` goes on every query. If more than 200 rows match, no rows come back and the query is rejected, so the model can never answer from part of the data. It can retry with an aggregate |
 | Time cap | A query still running after 10 seconds is cancelled |
-| Turn cap | 10 model calls per question |
-| Audit log | Every tool call, with the SQL before and after rewriting, goes to `agent/logs/transcript.jsonl` |
+| Turn cap | 10 model calls per question, then a deterministic fallback |
+| Audit log | Every tool call, with the SQL before and after rewriting, and every fallback with its reason, goes to `agent/logs/transcript.jsonl` |
 | Honesty rules in the prompt | Never state a number that didn't come from a query in this conversation; say "no data" when a query returns nothing; give the brand and date range for every number; end with a freshness and test-status note |
 
 What goes wrong without them:
@@ -312,18 +327,48 @@ What goes wrong without them:
 - **The wrong anchor.** The data ends on 2026-08-29. "Last week" against the calendar finds nothing, and the model may fill the gap. The prompt anchors relative dates to the latest loaded date, and the answer has to say so.
 - **The cross-tenant leak.** One easy-to-miss case: `transform/target/run_results.json` holds only the most recent dbt build, which is one brand's. A health tool that read it blindly would report brand B's test results to someone asking about brand A. `get_data_health` checks which brand the run was for, and reports "unknown" when it doesn't match.
 
+### Deterministic fallbacks
+
+When the agent can't answer safely, the user gets text written in `agent/fallbacks.py`, never text the model wrote. A model asked to explain why it can't answer will often produce a fluent explanation with a guess inside it; fixed text can't.
+
+| Trigger | Detected by | What the user gets |
+|---|---|---|
+| The question names another brand (`bloom_skin`, `Bloom Skin`, `bloom-skin`) | A name check before any model call | "This session can only see acme_apparel's data…". It doesn't confirm the other brand exists, since that would itself leak across tenants |
+| A query that isn't a read, or reads outside the brand's marts | The SQL guardrail | A fixed refusal. The question ends; the model gets no second try |
+| 3 fixable rejections (unknown table, parse error, timeout, row cap) | The loop counts them | "I couldn't write a valid query…", or for the row cap, "try a narrower question" |
+| 10 model calls without an answer | The turn cap | "I stopped after 10 steps…" |
+| The model declines, even after the model fallback | `stop_reason: refusal` | "The model declined to answer…". Any text it wrote is discarded |
+| The answer is cut off | `stop_reason: max_tokens` | "The answer was cut off…". The partial answer is not shown |
+| Out of scope, about another brand, or too vague | The model calls `cannot_answer(reason)` | A fixed explanation, or a clarifying question: "Which period do you mean? The data covers 2026-07-01 to 2026-08-29…" |
+
+The model can choose a reason through `cannot_answer`, but never the words. One limit: the model can still skip the tool and refuse in its own words, as an ordinary answer. The code doesn't prevent that; the evals catch it, because a case that expects a fallback fails when the agent writes its own reply.
+
+**Fallback reports.** For two known question types, a fixed query runs and its result is attached under the label **"Fallback report, not an agent answer"**:
+
+- **Revenue for a period:** net and gross revenue, refunds, orders, ad spend and MER, for "last week", "last month", a month with a year ("August 2026") or two dates. The periods resolve the same way the system prompt tells the model to.
+- **Spend at risk:** each product and campaign with spend at risk on the latest day there was any.
+
+The reports go through the same guardrail and connection as the model's queries, so they're tenant-scoped, read-only and capped too. A test checks the revenue report against an independent query on `fct_orders`. No report is attached when the question isn't one of those types, when it's about another brand or out of scope, or when the period can't be resolved; the user gets the clarifying question instead.
+
+**Not the same as the model fallback.** `loop.py` also passes `fallbacks="default"` to the API: if Claude Opus 5.5 declines a request, the API retries it on another Claude model. That is still a model answering. The deterministic fallbacks above take over only when no model gives a safe answer.
+
+Every fallback is logged with its reason, any detail (such as the rejected SQL's error), and the report's SQL. Each trigger has a test with a scripted model, so none of them need an API key: 37 new tests in `tests/test_agent.py` cover the triggers, the reports, period resolution and the grader rules below.
+
 ### Evals
 
-`evals/questions.py` has 10 questions. Each one's correct answer is computed by a SQL query at eval time, and the grader checks that every expected value appears in the answer (within 0.5%), plus required text such as a SKU or a date. Several questions sit next to a plausible wrong answer, which is recorded in the case:
+`evals/questions.py` has 14 questions. Each one's correct answer is computed by a SQL query at eval time, and the grader checks that every expected value appears in the answer (within 0.5%), plus required text such as a SKU or a date. Several questions sit next to a plausible wrong answer, which is recorded in the case:
 
 - MER, AOV and ROAS over a month: dividing the sums vs averaging the daily ratios (MER 2.38 vs 2.44; best-campaign ROAS 1.68 vs 2.32)
 - "Last week": the last complete Monday–Sunday week (Aug 17–23), not the 7 days to the latest date
 - Lost revenue to stockouts: all out-of-stock cancellations ($2,112), not the `mart_spend_at_risk` column ($1,765), which leaves out the $347 of in-stock items cancelled in the same orders
 - A month with no data, a question about the other tenant, and a data-quality question that needs `get_data_health`
+- Four cases that must end in a deterministic fallback: the other brand's name written with a space, a request to delete data, an out-of-scope question (the weather), and a question too vague to answer ("What was it last week?")
+
+The grader checks fallbacks in both directions. A case that expects one fails if the agent writes its own answer. Every other case fails if any fallback fires, so refusing an answerable question counts as a failure too.
 
 `python -m evals.run_evals --no-definitions` reruns them without the business-definitions block in the system prompt, to measure what those definitions contribute.
 
-**Results (2026-10-03, `claude-opus-5-5`, one run each):** 10/10 with the definitions, and 10/10 without them. Full answers and tool calls are in `evals/results/`. These runs used an earlier wording of the lost-revenue definition, written before `fct_stockout_cancellations` existed; the definition now points at that model. The evals have not been re-run since.
+**Results (2026-10-03, `claude-opus-5-5`, one run each):** 10/10 with the definitions, and 10/10 without them, on the original 10 questions, before the fallbacks existed. Full answers and tool calls are in `evals/results/`. These runs used an earlier wording of the lost-revenue definition, written before `fct_stockout_cancellations` existed; the definition now points at that model. The evals have not been re-run since: the four fallback cases and the fallback grading have no live results yet. The two other-brand cases never reach the model, so a pytest test runs them through the real grader without an API key, and they pass.
 
 What that does and doesn't show:
 
@@ -334,7 +379,7 @@ What that does and doesn't show:
 
 The live run turned up one bug in the harness itself: the eval runner opened its own DuckDB connection with default settings, and DuckDB refuses a second connection to the same file with different settings. Both now go through `agent.tools.connect()`.
 
-Limits of this eval: 10 questions is a smoke test, not a benchmark. The grader matches strings, so an answer that contains the right number next to a wrong one still passes. The questions were written alongside the prompt, so they are not a held-out set. `data_quality` only runs when the last dbt build was for `bloom_skin`.
+Limits of this eval: 14 questions is a smoke test, not a benchmark. The grader matches strings, so an answer that contains the right number next to a wrong one still passes. The questions were written alongside the prompt, so they are not a held-out set. `data_quality` only runs when the last dbt build was for `bloom_skin`. The four fallback cases have not been run against the live API yet; the only results so far are the 10/10 on the original 10 questions. The model can still refuse in free text instead of calling `cannot_answer`; the eval catches that, the code doesn't prevent it.
 
 ## Future improvements
 
