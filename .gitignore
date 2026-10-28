@@ -7,3 +7,4 @@ dbt_packages/
 .user.yml
 __pycache__/
 .pytest_cache/
+.DS_Store
